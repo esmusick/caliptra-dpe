@@ -1,33 +1,31 @@
 // Licensed under the Apache-2.0 license
 
-use crate::{AlgLen, Crypto, CryptoBuf, CryptoError, Digest, EcdsaPub, EcdsaSig, Hasher, HmacSig, hkdf::*};
-use core::ops::Deref;
-use elliptic_curve::{
-    AffinePoint,
-    point::PointCompression,
-    sec1::{EncodedPoint, FromEncodedPoint, ModulusSize, ToEncodedPoint},
-     Curve, CurveArithmetic, FieldBytesSize, ScalarPrimitive, SecretKey,
+use crate::{
+    hkdf::*, AlgLen, Crypto, CryptoBuf, CryptoError, Digest, EcdsaPub, EcdsaSig, Hasher, HmacSig,
 };
+use core::ops::Deref;
+use ecdsa::{signature::Signer, Signature};
 use hmac::{Hmac, Mac};
 use p256::NistP256;
-use ecdsa::{Signature, signature::Signer};
 use p384::NistP384;
 use rand::{rngs::StdRng, RngCore, SeedableRng};
+use sec1::DecodeEcPrivateKey;
 use sha2::{digest::DynDigest, Sha256, Sha384};
 use std::boxed::Box;
 
-const RUSTCRYPTO_EC_ERROR: CryptoError = CryptoError::CryptoLibError(1);
-const RUSTCRYPTO_ECDSA_ERROR: CryptoError = CryptoError::CryptoLibError(2);
+const RUSTCRYPTO_ECDSA_ERROR: CryptoError = CryptoError::CryptoLibError(1);
+const RUSTCRYPTO_SEC_ERROR: CryptoError = CryptoError::CryptoLibError(2);
 
-impl From<elliptic_curve::Error> for CryptoError {
-    fn from(_value: elliptic_curve::Error) -> Self {
-        RUSTCRYPTO_EC_ERROR
-    }
-}
 
 impl From<ecdsa::Error> for CryptoError {
     fn from(_value: ecdsa::Error) -> Self {
         RUSTCRYPTO_ECDSA_ERROR
+    }
+}
+
+impl From<sec1::Error> for CryptoError {
+    fn from(_value: sec1::Error) -> Self {
+        RUSTCRYPTO_SEC_ERROR
     }
 }
 
@@ -73,31 +71,6 @@ impl RustCryptoImpl {
         let seeded_rng = StdRng::from_seed(SEED);
         RustCryptoImpl(seeded_rng)
     }
-
-    fn ec_key_from_secret_key<C: Curve>(
-        secret_key: &CryptoBuf,
-    ) -> Result<SecretKey<C>, elliptic_curve::Error> {
-        // TODO: This is wrong. 
-        // The only equivalent to mul_by_generator I found is implemented by ProjectivePoint, but I see no way to get from there to a SecretKey.
-        // https://docs.rs/elliptic-curve/0.13.4/elliptic_curve/index.html#type-conversions
-        let secret_scalar = ScalarPrimitive::from_slice(secret_key.bytes())?;
-        Ok(SecretKey::new(secret_scalar))
-    }
-
-    fn get_keypair<C: Curve>(secret: &CryptoBuf) -> Result<EcdsaPub, CryptoError>
-    where
-        C: CurveArithmetic + PointCompression,
-        AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
-        FieldBytesSize<C>: ModulusSize,
-    {
-        let secret_key = Self::ec_key_from_secret_key::<C>(&secret)?;
-        // TODO: This is wrong.
-        // openssl impl uses affine coordinates specificially, but AFAICT the y coordinate is not accessible on the AffinePoint type in RustCrypto?
-        let point = EncodedPoint::<C>::from(secret_key.public_key());
-        let x = CryptoBuf::new(point.x().ok_or(RUSTCRYPTO_EC_ERROR)?.as_slice())?;
-        let y = CryptoBuf::new(point.y().ok_or(RUSTCRYPTO_EC_ERROR)?.as_slice())?;
-        Ok(EcdsaPub { x, y })
-    }
 }
 
 impl Crypto for RustCryptoImpl {
@@ -137,12 +110,20 @@ impl Crypto for RustCryptoImpl {
         let secret = hkdf_get_priv_key(algs, cdi, label, info)?;
         match algs {
             AlgLen::Bit256 => {
-                let public = RustCryptoImpl::get_keypair::<NistP256>(&secret)?;
-                Ok((secret, public))
+                let signing = p256::ecdsa::SigningKey::from_slice(&secret.bytes())?;
+                let verifying = p256::ecdsa::VerifyingKey::from(&signing);
+                let point = verifying.to_encoded_point(false);
+                let x = CryptoBuf::new(point.x().ok_or(RUSTCRYPTO_ECDSA_ERROR)?.as_slice())?;
+                let y = CryptoBuf::new(point.y().ok_or(RUSTCRYPTO_ECDSA_ERROR)?.as_slice())?;
+                Ok((secret, EcdsaPub { x, y }))
             }
             AlgLen::Bit384 => {
-                let public = RustCryptoImpl::get_keypair::<NistP384>(&secret)?;
-                Ok((secret, public))
+                let signing = p384::ecdsa::SigningKey::from_slice(&secret.bytes())?;
+                let verifying = p384::ecdsa::VerifyingKey::from(&signing);
+                let point = verifying.to_encoded_point(false);
+                let x = CryptoBuf::new(point.x().ok_or(RUSTCRYPTO_ECDSA_ERROR)?.as_slice())?;
+                let y = CryptoBuf::new(point.y().ok_or(RUSTCRYPTO_ECDSA_ERROR)?.as_slice())?;
+                Ok((secret, EcdsaPub { x, y }))
             }
         }
     }
@@ -154,27 +135,19 @@ impl Crypto for RustCryptoImpl {
     ) -> Result<EcdsaSig, CryptoError> {
         match algs {
             AlgLen::Bit256 => {
-                let ec_secret_key = SecretKey::from_sec1_pem(
-                    std::str::from_utf8(include_bytes!(concat!(
-                        env!("OUT_DIR"),
-                        "/alias_priv_256.pem"
-                    )))
-                    .unwrap(),
-                )
-                .unwrap();
-                let (sig, _) = p256::ecdsa::SigningKey::from(ec_secret_key).try_sign(digest.bytes())?;
+                let signing_key = p256::ecdsa::SigningKey::read_sec1_pem_file(concat!(
+                    env!("OUT_DIR"),
+                    "/alias_priv_256.pem"
+                ))?;
+                let sig: p256::ecdsa::Signature = signing_key.sign(digest.bytes());
                 sig.try_into()
             }
             AlgLen::Bit384 => {
-                let ec_secret_key = SecretKey::from_sec1_pem(
-                    std::str::from_utf8(include_bytes!(concat!(
-                        env!("OUT_DIR"),
-                        "/alias_priv_384.pem"
-                    )))
-                    .unwrap(),
-                )
-                .unwrap();
-                let (sig, _) = p384::ecdsa::SigningKey::from(ec_secret_key).try_sign(digest.bytes())?;
+                let signing_key = p384::ecdsa::SigningKey::read_sec1_pem_file(concat!(
+                    env!("OUT_DIR"),
+                    "/alias_priv_384.pem"
+                ))?;
+                let sig: p384::ecdsa::Signature = signing_key.sign(digest.bytes());
                 sig.try_into()
             }
         }
@@ -189,13 +162,13 @@ impl Crypto for RustCryptoImpl {
     ) -> Result<EcdsaSig, CryptoError> {
         match algs {
             AlgLen::Bit256 => {
-                let ec_secret_key = RustCryptoImpl::ec_key_from_secret_key(&priv_key)?;
-                let (sig, _) = p256::ecdsa::SigningKey::from(ec_secret_key).try_sign(digest.bytes())?;
+                let sig: p256::ecdsa::Signature =
+                    p256::ecdsa::SigningKey::from_slice(priv_key.bytes())?.sign(digest.bytes());
                 sig.try_into()
-            },
+            }
             AlgLen::Bit384 => {
-                let ec_secret_key = RustCryptoImpl::ec_key_from_secret_key(&priv_key)?;
-                let (sig, _) = p384::ecdsa::SigningKey::from(ec_secret_key).try_sign(digest.bytes())?;
+                let sig: p384::ecdsa::Signature =
+                    p384::ecdsa::SigningKey::from_slice(priv_key.bytes())?.sign(digest.bytes());
                 sig.try_into()
             }
         }
@@ -215,12 +188,39 @@ impl Crypto for RustCryptoImpl {
                 let mut hmac = Hmac::<Sha256>::new_from_slice(symmetric_key.bytes()).unwrap();
                 Mac::update(&mut hmac, digest.bytes());
                 HmacSig::new(hmac.finalize().into_bytes().as_slice())
-            },
+            }
             AlgLen::Bit384 => {
                 let mut hmac = Hmac::<Sha384>::new_from_slice(symmetric_key.bytes()).unwrap();
                 Mac::update(&mut hmac, digest.bytes());
                 HmacSig::new(hmac.finalize().into_bytes().as_slice())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ecdsa::signature::Verifier;
+    use elliptic_curve::ScalarPrimitive;
+    use p256::Scalar;
+    #[test]
+    fn sign_verify() {
+        let mut crypto = RustCryptoImpl::new();
+        let digest = CryptoBuf::new(b"test").unwrap();
+        let sig = crypto
+            .ecdsa_sign_with_alias(AlgLen::Bit256, &digest)
+            .unwrap();
+
+        let signing_key = p256::ecdsa::SigningKey::from_sec1_der(include_bytes!(
+            "../../platform/src/test_data/key_256.der"
+        ))
+        .unwrap();
+        let verifying = p256::ecdsa::VerifyingKey::from(&signing_key);
+        let r = ScalarPrimitive::from_slice(sig.r.bytes()).unwrap();
+        let s = ScalarPrimitive::from_slice(sig.s.bytes()).unwrap();
+        let p256_sig =
+            Signature::<NistP256>::from_scalars(&Scalar::from(r), &Scalar::from(s)).unwrap();
+        assert!(verifying.verify(&digest.bytes(), &p256_sig).is_ok());
     }
 }

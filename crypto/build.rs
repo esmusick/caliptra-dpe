@@ -1,6 +1,6 @@
 // Licensed under the Apache-2.0 license
 
-#[cfg(feature="rustcrypto")]
+#[cfg(feature = "rustcrypto")]
 use std::ops::Deref;
 
 fn main() {
@@ -63,17 +63,18 @@ fn main() {
     #[cfg(feature = "rustcrypto")]
     {
         use {
-            elliptic_curve::{SecretKey},
+            base64ct::LineEnding,
+            ecdsa::SigningKey,
             fs::File,
             p256::NistP256,
             p384::NistP384,
-            base64ct::LineEnding,
             rand::{rngs::StdRng, SeedableRng},
+            sec1::{DecodeEcPrivateKey, EncodeEcPrivateKey},
             std::env,
             std::fs,
-            std::str,
             std::io::Write,
             std::path::Path,
+            std::str,
         };
 
         const ALIAS_PRIV_256: &str = "../platform/src/test_data/key_256.pem";
@@ -86,21 +87,19 @@ fn main() {
 
         // generate 256 bit private key in PEM format
         let pem_256 = if Path::new(ALIAS_PRIV_256).exists() {
-            let input_pem = fs::read(ALIAS_PRIV_256).unwrap();
-            let ec_secret = SecretKey::<NistP256>::from_sec1_pem(str::from_utf8(&input_pem).unwrap()).unwrap();
+            let ec_secret = SigningKey::<NistP256>::read_sec1_pem_file(ALIAS_PRIV_256).unwrap();
             ec_secret.to_sec1_pem(LineEnding::default()).unwrap()
         } else {
-            let ec_secret = SecretKey::<NistP256>::random(&mut StdRng::from_entropy());
+            let ec_secret = SigningKey::<NistP256>::random(&mut StdRng::from_entropy());
             ec_secret.to_sec1_pem(LineEnding::default()).unwrap()
         };
 
         // generate 384 bit private key in PEM format
         let pem_384 = if Path::new(ALIAS_PRIV_384).exists() {
-            let input_pem = fs::read(ALIAS_PRIV_384).unwrap();
-            let ec_secret = SecretKey::<NistP384>::from_sec1_pem(str::from_utf8(&input_pem).unwrap()).unwrap();
+            let ec_secret = SigningKey::<NistP384>::read_sec1_pem_file(ALIAS_PRIV_384).unwrap();
             ec_secret.to_sec1_pem(LineEnding::default()).unwrap()
         } else {
-            let ec_secret = SecretKey::<NistP384>::random(&mut StdRng::from_entropy());
+            let ec_secret = SigningKey::<NistP384>::random(&mut StdRng::from_entropy());
             ec_secret.to_sec1_pem(LineEnding::default()).unwrap()
         };
 
