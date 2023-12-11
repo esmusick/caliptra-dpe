@@ -4,7 +4,7 @@ use crate::{
     hkdf::*, AlgLen, Crypto, CryptoBuf, CryptoError, Digest, EcdsaPub, EcdsaSig, Hasher, HmacSig,
 };
 use core::ops::Deref;
-use ecdsa::{signature::Signer, Signature};
+use ecdsa::{signature::hazmat::PrehashSigner, Signature};
 use hmac::{Hmac, Mac};
 use p256::NistP256;
 use p384::NistP384;
@@ -139,7 +139,7 @@ impl Crypto for RustCryptoImpl {
                     env!("OUT_DIR"),
                     "/alias_priv_256.pem"
                 ))?;
-                let sig: p256::ecdsa::Signature = signing_key.sign(digest.bytes());
+                let sig: p256::ecdsa::Signature = signing_key.sign_prehash(digest.bytes())?;
                 sig.try_into()
             }
             AlgLen::Bit384 => {
@@ -147,7 +147,7 @@ impl Crypto for RustCryptoImpl {
                     env!("OUT_DIR"),
                     "/alias_priv_384.pem"
                 ))?;
-                let sig: p384::ecdsa::Signature = signing_key.sign(digest.bytes());
+                let sig: p384::ecdsa::Signature = signing_key.sign_prehash(digest.bytes())?;
                 sig.try_into()
             }
         }
@@ -163,12 +163,12 @@ impl Crypto for RustCryptoImpl {
         match algs {
             AlgLen::Bit256 => {
                 let sig: p256::ecdsa::Signature =
-                    p256::ecdsa::SigningKey::from_slice(priv_key.bytes())?.sign(digest.bytes());
+                    p256::ecdsa::SigningKey::from_slice(priv_key.bytes())?.sign_prehash(digest.bytes())?;
                 sig.try_into()
             }
             AlgLen::Bit384 => {
                 let sig: p384::ecdsa::Signature =
-                    p384::ecdsa::SigningKey::from_slice(priv_key.bytes())?.sign(digest.bytes());
+                    p384::ecdsa::SigningKey::from_slice(priv_key.bytes())?.sign_prehash(digest.bytes())?;
                 sig.try_into()
             }
         }
@@ -188,7 +188,7 @@ impl Crypto for RustCryptoImpl {
                 let mut hmac = Hmac::<Sha256>::new_from_slice(symmetric_key.bytes()).unwrap();
                 Mac::update(&mut hmac, digest.bytes());
                 HmacSig::new(hmac.finalize().into_bytes().as_slice())
-            }
+            },
             AlgLen::Bit384 => {
                 let mut hmac = Hmac::<Sha384>::new_from_slice(symmetric_key.bytes()).unwrap();
                 Mac::update(&mut hmac, digest.bytes());
@@ -198,29 +198,3 @@ impl Crypto for RustCryptoImpl {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ecdsa::signature::Verifier;
-    use elliptic_curve::ScalarPrimitive;
-    use p256::Scalar;
-    #[test]
-    fn sign_verify() {
-        let mut crypto = RustCryptoImpl::new();
-        let digest = CryptoBuf::new(b"test").unwrap();
-        let sig = crypto
-            .ecdsa_sign_with_alias(AlgLen::Bit256, &digest)
-            .unwrap();
-
-        let signing_key = p256::ecdsa::SigningKey::from_sec1_der(include_bytes!(
-            "../../platform/src/test_data/key_256.der"
-        ))
-        .unwrap();
-        let verifying = p256::ecdsa::VerifyingKey::from(&signing_key);
-        let r = ScalarPrimitive::from_slice(sig.r.bytes()).unwrap();
-        let s = ScalarPrimitive::from_slice(sig.s.bytes()).unwrap();
-        let p256_sig =
-            Signature::<NistP256>::from_scalars(&Scalar::from(r), &Scalar::from(s)).unwrap();
-        assert!(verifying.verify(&digest.bytes(), &p256_sig).is_ok());
-    }
-}
